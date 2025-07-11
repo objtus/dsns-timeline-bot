@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+venv/
+.venv/
+
+# Environment variables
+.env
+.env.example
+
+# Database
+*.db
+*.sqlite
+
+# Logs
+logs/*.log
+
+# VS Code
+.vscode/settings.json
