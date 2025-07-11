@@ -9,6 +9,7 @@ venv/
 # Environment variables
 .env
 .env.example
+.secret_key
 
 # Database
 *.db
