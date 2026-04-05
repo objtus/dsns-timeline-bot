@@ -92,3 +92,4 @@ class BaseHandler:
             logger.warning(f"URL付加エラー: {e}")
             # URL付加に失敗しても元のメッセージを返す
             return message
+    

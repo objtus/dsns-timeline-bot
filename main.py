@@ -93,6 +93,8 @@ class DSNSTimelineBot:
         self.data_service = None
         self.command_router = None
         self.bot_client = None
+        self.llm_service = None
+        self.llm_commentary = None
         
         # ボット状態管理
         self.is_running = False
@@ -136,12 +138,44 @@ class DSNSTimelineBot:
                 self.bot_client = None
                 logger.warning("ボットクライアントなしで続行（テスト用）")
             
+            # LLMService初期化
+            try:
+                from llm_service import LLMService
+                self.llm_service = LLMService(self.config)
+                if self.llm_service.is_enabled():
+                    logger.info("✅ LLMサービス初期化完了")
+                    # ヘルスチェック
+                    if self.llm_service.health_check():
+                        logger.info("✅ LLM APIヘルスチェック成功")
+                    else:
+                        logger.warning("⚠️  LLM APIヘルスチェック失敗")
+                else:
+                    logger.info("ℹ️  LLM機能は無効です (LLM_ENABLED=false)")
+            except Exception as e:
+                logger.error(f"LLMサービス初期化失敗: {e}")
+                logger.debug(traceback.format_exc())
+                self.llm_service = None
+                logger.warning("LLMサービスなしで続行")
+            
             # CommandRouter初期化
             from command_router import CommandRouter
             self.command_router = CommandRouter(
-                self.config, self.database, self.data_service, self.bot_client
+                self.config, self.database, self.data_service, self.bot_client, self.llm_service
             )
             logger.info("✅ CommandRouter初期化完了")
+            
+            # LLMCommentaryService初期化
+            if self.llm_service and self.llm_service.is_enabled():
+                try:
+                    from llm_commentary import LLMCommentaryService
+                    self.llm_commentary = LLMCommentaryService(
+                        self.config, self.database, self.data_service, self.llm_service
+                    )
+                    logger.info("✅ LLMCommentaryService初期化完了")
+                except Exception as e:
+                    logger.error(f"LLMCommentaryService初期化失敗: {e}")
+                    logger.debug(traceback.format_exc())
+                    self.llm_commentary = None
             
             # BotClientにCommandRouterを設定
             if self.bot_client:
@@ -304,6 +338,55 @@ class DSNSTimelineBot:
             logger.error(f"終了処理エラー: {e}")
             logger.debug(traceback.format_exc())
     
+    async def _schedule_llm_commentary(self):
+        """LLMコメント投稿のスケジューラー（毎日00:05実行）"""
+        try:
+            logger.info("LLMコメントスケジューラー開始")
+            
+            while not self.shutdown_requested:
+                try:
+                    # 現在時刻
+                    now = datetime.now()
+                    
+                    # 次回実行時刻を計算（00:10）
+                    next_run = now.replace(hour=0, minute=10, second=0, microsecond=0)
+                    if now >= next_run:
+                        # 今日の00:10を過ぎていれば明日に設定
+                        next_run += timedelta(days=1)
+                    
+                    # 待機時間を計算
+                    wait_seconds = (next_run - now).total_seconds()
+                    logger.info(f"次回LLMコメント投稿: {next_run.strftime('%Y-%m-%d %H:%M:%S')} ({wait_seconds:.0f}秒後)")
+                    
+                    # 待機（1分ごとにチェック）
+                    while not self.shutdown_requested and datetime.now() < next_run:
+                        await asyncio.sleep(60)
+                    
+                    if self.shutdown_requested:
+                        break
+                    
+                    # LLMコメント投稿実行
+                    logger.info("=== LLMコメント投稿開始 ===")
+                    
+                    if self.llm_commentary and self.bot_client:
+                        success = await self.llm_commentary.post_commentary(self.bot_client)
+                        if success:
+                            logger.info("✅ LLMコメント投稿完了")
+                        else:
+                            logger.warning("⚠️  LLMコメント投稿失敗")
+                    else:
+                        logger.warning("LLMコメンタリーまたはBotClientが初期化されていません")
+                    
+                except Exception as e:
+                    logger.error(f"LLMコメントスケジューラーエラー: {e}")
+                    logger.debug(traceback.format_exc())
+                    # エラーが発生しても継続
+                    await asyncio.sleep(60)
+                    
+        except Exception as e:
+            logger.error(f"LLMコメントスケジューラー致命的エラー: {e}")
+            logger.debug(traceback.format_exc())
+    
     async def run_forever(self):
         """ボットの無限実行ループを開始します。"""
         try:
@@ -319,6 +402,12 @@ class DSNSTimelineBot:
             
             # systemd環境での動作確認
             logger.info("✅ ボット開始完了 - systemdサービスとして動作中")
+            
+            # LLMコメントスケジューラータスクを起動
+            scheduler_task = None
+            if self.llm_commentary:
+                scheduler_task = asyncio.create_task(self._schedule_llm_commentary())
+                logger.info("✅ LLMコメントスケジューラー起動")
             
             # メインループ
             while not self.shutdown_requested:

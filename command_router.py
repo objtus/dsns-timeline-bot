@@ -11,7 +11,7 @@ from datetime import datetime
 
 from handlers import (
     TodayHandler, DateHandler, SearchHandler, 
-    HelpHandler, StatusHandler, DecadeHandler, CategoryHandler
+    HelpHandler, StatusHandler, DecadeHandler, CategoryHandler, LLMHandler
 )
 from constants import CommandTypes, StatusSubTypes, DecadeSubTypes, ErrorMessages
 from exceptions import CommandParseError, HandlerError
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class CommandRouter:
     """コマンド解析とハンドラールーティング管理"""
     
-    def __init__(self, config, database, data_service, bot_client: Optional[Any] = None):
+    def __init__(self, config, database, data_service, bot_client: Optional[Any] = None, llm_service: Optional[Any] = None):
         """
         ルーター初期化
         
@@ -31,11 +31,13 @@ class CommandRouter:
             database: データベースオブジェクト
             data_service: データサービスオブジェクト
             bot_client: ボットクライアント（Phase 3で使用）
+            llm_service: LLMサービス（LLM機能使用時）
         """
         self.config = config
         self.database = database
         self.data_service = data_service
         self.bot_client = bot_client
+        self.llm_service = llm_service
         
         # 全ハンドラーを初期化・管理
         self.handlers = {
@@ -47,6 +49,11 @@ class CommandRouter:
             CommandTypes.DECADE: DecadeHandler(config, database, data_service, bot_client),
             'category': CategoryHandler(config, database, data_service, bot_client),
         }
+        
+        # LLMハンドラーは llm_service が提供された場合のみ追加
+        if llm_service:
+            self.handlers[CommandTypes.LLM] = LLMHandler(config, database, data_service, bot_client, llm_service)
+            logger.info("LLMハンドラーを登録しました")
         
         logger.info(f"CommandRouter初期化完了: {len(self.handlers)}個のハンドラー")
         
@@ -69,6 +76,10 @@ class CommandRouter:
             Dict[str, Any]: コマンド情報を含む辞書
         """
         try:
+            # Noneチェック
+            if content is None:
+                content = ""
+            
             # ボット名の除去
             if bot_username:
                 content = content.replace(f'@{bot_username}', '').strip()
@@ -100,6 +111,16 @@ class CommandRouter:
                 logger.info("ヘルプコマンド検出")
                 return {'type': CommandTypes.HELP}
             
+            # LLM会話
+            if content.startswith('/llm ') or content.startswith('／llm '):
+                logger.info("LLMコマンド検出")
+                # /llm の後のメッセージを取得
+                message = content.replace('/llm ', '').replace('／llm ', '').strip()
+                return {
+                    'type': CommandTypes.LLM,
+                    'message': message
+                }
+            
             # ステータス（システム監視）- カテゴリコマンドの後にチェック
             if any(keyword in content_lower for keyword in ['status', 'ステータス', '状態', 'じょうたい']):
                 # カテゴリコマンドの可能性を除外
@@ -113,6 +134,15 @@ class CommandRouter:
                         sub_command = StatusSubTypes.BOT
                     elif '年表' in content or 'timeline' in content_lower:
                         sub_command = StatusSubTypes.TIMELINE
+                    
+                    # 重複したステータスコマンドの処理
+                    # 複数のステータスキーワードがある場合は最初のサブコマンドを優先
+                    status_keywords = ['status', 'ステータス', '状態', 'じょうたい']
+                    status_count = sum(1 for keyword in status_keywords if keyword in content_lower)
+                    
+                    if status_count > 1:
+                        logger.debug(f"重複ステータスコマンド検出: {status_count}個のステータスキーワード")
+                        # 重複があっても最初に見つかったサブコマンドを優先
                     
                     return {
                         'type': CommandTypes.STATUS,
@@ -214,7 +244,8 @@ class CommandRouter:
             start_year = None
             end_year = None
             
-            decade_strings = {                '1920年代': (1920, 1929),
+            decade_strings = {
+                '1920年代': (1920, 1929),
                 '30年代': (1930, 1939),
                 '1930年代': (1930, 1939),
                 '40年代': (1940, 1949),
@@ -276,6 +307,7 @@ class CommandRouter:
             # サブコマンド判定
             sub_commands = {
                 '統計': ['統計', 'とうけい', 'stats', 'statistics'],
+                '一覧': ['一覧', 'いちらん', 'list', 'events', 'イベント'],
                 '代表': ['代表', 'だいひょう', '重要', 'じゅうよう', 'representative'],
                 '概要': ['概要', 'がいよう', 'まとめ', 'summary', 'overview']
             }
@@ -456,8 +488,19 @@ class CommandRouter:
             self.command_count += 1
             self.last_command_time = datetime.now()
             
-            # コマンド解析
-            content = getattr(note, 'text', '').strip()
+            # コマンド解析（MiPAのNote内部構造に対応）
+            content = None
+            # 方法1: 通常のtext属性
+            if hasattr(note, 'text') and note.text:
+                content = note.text
+            # 方法2: raw_noteから取得
+            elif hasattr(note, '_Note__raw_note'):
+                raw_note = note._Note__raw_note
+                if isinstance(raw_note, dict):
+                    content = raw_note.get('text', '')
+            
+            # Noneチェックと文字列化
+            content = (content or '').strip()
             command = self.parse_command(content, bot_username)
             
             logger.info(f"ルーティング実行: {command['type']} (#{self.command_count})")

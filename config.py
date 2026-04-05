@@ -101,6 +101,39 @@ class Config:
         except ValueError:
             return 6
     
+    # 接続監視設定
+    @property
+    def connection_health_check_interval(self) -> int:
+        """接続状態監視間隔（秒）"""
+        try:
+            return int(os.getenv('CONNECTION_HEALTH_CHECK_INTERVAL', '300'))  # 5分
+        except ValueError:
+            return 300
+    
+    @property
+    def heartbeat_timeout_seconds(self) -> int:
+        """ハートビートタイムアウト（秒）"""
+        try:
+            return int(os.getenv('HEARTBEAT_TIMEOUT_SECONDS', '600'))  # 10分
+        except ValueError:
+            return 600
+    
+    @property
+    def max_connection_failures(self) -> int:
+        """最大接続失敗回数"""
+        try:
+            return int(os.getenv('MAX_CONNECTION_FAILURES', '10'))  # 10回
+        except ValueError:
+            return 10
+    
+    @property
+    def connection_recovery_delay(self) -> int:
+        """接続復旧時の遅延（秒）"""
+        try:
+            return int(os.getenv('CONNECTION_RECOVERY_DELAY', '30'))  # 30秒
+        except ValueError:
+            return 30
+    
     # データベース設定
     @property
     def database_path(self) -> Path:
@@ -249,6 +282,46 @@ class Config:
         if self.debug_mode:
             logging.getLogger().setLevel(logging.DEBUG)
     
+    # LLM関連設定
+    @property
+    def llm_enabled(self) -> bool:
+        """LLM機能が有効かどうか"""
+        return os.getenv('LLM_ENABLED', 'false').lower() == 'true'
+    
+    @property
+    def llm_api_url(self) -> str:
+        """Ollama APIのURL"""
+        return os.getenv('LLM_API_URL', 'http://localhost:11434')
+    
+    @property
+    def llm_model(self) -> str:
+        """使用するLLMモデル名"""
+        return os.getenv('LLM_MODEL', 'dsns')
+    
+    @property
+    def llm_timeout(self) -> int:
+        """LLM API呼び出しのタイムアウト（秒）"""
+        try:
+            return int(os.getenv('LLM_TIMEOUT', '30'))
+        except ValueError:
+            return 30
+    
+    @property
+    def llm_max_tokens(self) -> int:
+        """LLMの最大トークン数"""
+        try:
+            return int(os.getenv('LLM_MAX_TOKENS', '100'))
+        except ValueError:
+            return 100
+    
+    @property
+    def llm_temperature(self) -> float:
+        """LLMの温度パラメータ"""
+        try:
+            return float(os.getenv('LLM_TEMPERATURE', '0.8'))
+        except ValueError:
+            return 0.8
+    
     def get_env_summary(self) -> dict:
         """
         設定値の概要を取得（機密情報は隠す）
@@ -268,7 +341,14 @@ class Config:
             'debug_mode': self.debug_mode,
             'dry_run_mode': self.dry_run_mode,
             'http_timeout': self.http_timeout,
-            'data_update_interval_hours': self.data_update_interval_hours
+            'data_update_interval_hours': self.data_update_interval_hours,
+            'connection_health_check_interval': self.connection_health_check_interval,
+            'max_connection_failures': self.max_connection_failures,
+            'heartbeat_timeout_seconds': self.heartbeat_timeout_seconds,
+            'llm_enabled': self.llm_enabled,
+            'llm_api_url': self.llm_api_url,
+            'llm_model': self.llm_model,
+            'llm_timeout': self.llm_timeout
         }
     
     def __str__(self) -> str:

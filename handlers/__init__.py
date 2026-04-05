@@ -12,6 +12,7 @@ from .help_handler import HelpHandler
 from .status_handler import StatusHandler
 from .decade_handler import DecadeHandler
 from .category_handler import CategoryHandler
+from .llm_handler import LLMHandler
 
 __all__ = [
     'BaseHandler',
@@ -21,5 +22,6 @@ __all__ = [
     'HelpHandler',
     'StatusHandler',
     'DecadeHandler',
-    'CategoryHandler'
+    'CategoryHandler',
+    'LLMHandler'
 ]

@@ -46,6 +46,7 @@ class CommandTypes:
     HELP = 'help'
     STATUS = 'status'
     DECADE = 'decade'
+    LLM = 'llm'
 
 class StatusSubTypes:
     """ステータスサブタイプ"""

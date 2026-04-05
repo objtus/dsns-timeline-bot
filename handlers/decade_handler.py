@@ -70,12 +70,14 @@ class DecadeHandler(BaseHandler):
             
             if sub_type == '統計':
                 return await self._handle_statistics(start_year, end_year, decade_name, categories, exclude_categories)
+            elif sub_type == '一覧':
+                return await self._handle_list(start_year, end_year, decade_name, categories, exclude_categories)
             elif sub_type == '代表':
                 return await self._handle_representative(start_year, end_year, decade_name, categories, exclude_categories)
             elif sub_type == '概要':
                 return await self._handle_summary(start_year, end_year, decade_name, categories, exclude_categories)
             else:
-                return f"{decade_name}の機能を指定してください。\n\n利用可能な機能:\n• 統計 - 年代別統計情報\n• 代表 - 重要なイベント\n• 概要 - 年代の概要"
+                return f"{decade_name}の機能を指定してください。\n\n利用可能な機能:\n• 統計 - 年代別統計情報\n• 一覧 - 全イベント一覧\n• 代表 - 重要なイベント\n• 概要 - 年代の概要"
                 
         except Exception as e:
             logger.error(f"年代別処理エラー: {e}")
@@ -281,6 +283,112 @@ class DecadeHandler(BaseHandler):
         except Exception as e:
             logger.error(f"代表イベント処理エラー: {e}")
             raise DecadeHandlerError(f"代表イベント処理失敗: {e}")
+    
+    async def _handle_list(self, start_year: int, end_year: int, decade_name: str,
+                          categories: Optional[List[str]] = None, exclude_categories: Optional[List[str]] = None) -> str:
+        """
+        全イベント一覧処理
+        
+        Args:
+            start_year: 開始年
+            end_year: 終了年
+            decade_name: 年代名
+            categories: 含めるカテゴリリスト（オプション）
+            exclude_categories: 除外するカテゴリリスト（オプション）
+            
+        Returns:
+            str: イベント一覧メッセージ
+            
+        Raises:
+            DecadeHandlerError: 一覧処理エラー時
+        """
+        try:
+            if categories is None:
+                categories = []
+            if exclude_categories is None:
+                exclude_categories = []
+                
+            if categories:
+                # カテゴリ複合条件の場合
+                events = self.database.get_events_by_decade_and_categories(
+                    start_year, end_year, categories, exclude_categories
+                )
+            else:
+                # 通常の年代別検索
+                events = self.database.get_events_by_year_range(start_year, end_year)
+            
+            if not events:
+                category_info = ""
+                if categories:
+                    category_info = f"（カテゴリ: {', '.join(categories)}"
+                    if exclude_categories:
+                        category_info += f", 除外: {', '.join(exclude_categories)}"
+                    category_info += "）"
+                return f"{decade_name}{category_info}のイベントは見つかりませんでした。"
+            
+            # 時系列順にソート（年→月→日）
+            events.sort(key=lambda event: (event.year, event.month, event.day))
+            
+            # 重複除去：同じ内容のイベントは1つだけ表示
+            seen_contents = set()
+            unique_events = []
+            for event in events:
+                if event.content not in seen_contents:
+                    unique_events.append(event)
+                    seen_contents.add(event.content)
+                    if len(unique_events) >= 1000:  # 1000件まで取得
+                        break
+            
+            # カテゴリ情報を追加
+            category_info = ""
+            if categories:
+                category_info = f"（カテゴリ: {', '.join(categories)}"
+                if exclude_categories:
+                    category_info += f", 除外: {', '.join(exclude_categories)}"
+                category_info += "）"
+            
+            # 共通の文字数制限処理を使用（data_serviceのメソッド）
+            header_parts = [f"📋 **{decade_name}の全イベント一覧{category_info}**", ""]
+            footer_parts = []
+            
+            if self.data_service:
+                result = self.data_service._truncate_message_with_events(
+                    unique_events, self._format_decade_event, header_parts, footer_parts, 
+                    max_chars=MessageLimits.MAX_MESSAGE_LENGTH, 
+                    context_info="全イベント一覧生成完了"
+                )
+            else:
+                # data_serviceが利用できない場合のフォールバック
+                # 簡易的な文字数制限処理
+                header = f"📋 **{decade_name}の全イベント一覧{category_info}**\n\n"
+                truncated_message = header
+                included_count = 0
+                
+                for event in unique_events:
+                    event_line = self._format_decade_event(event) + "\n"
+                    
+                    if len(truncated_message + event_line) > MessageLimits.TRUNCATE_LENGTH:
+                        break
+                    
+                    truncated_message += event_line
+                    included_count += 1
+                
+                # 残件数表示
+                remaining = len(unique_events) - included_count
+                if remaining > 0:
+                    truncated_message += f"\n... 他{remaining}件"
+                
+                result = truncated_message
+            
+            # 共通のURL付加処理を使用
+            result = self._add_timeline_url(result, 'decade', start_year=start_year, end_year=end_year)
+            
+            logger.info(f"全イベント一覧生成完了: {len(result)}文字")
+            return result
+            
+        except Exception as e:
+            logger.error(f"全イベント一覧処理エラー: {e}")
+            raise DecadeHandlerError(f"全イベント一覧処理失敗: {e}")
     
     async def _handle_summary(self, start_year: int, end_year: int, decade_name: str,
                             categories: Optional[List[str]] = None, exclude_categories: Optional[List[str]] = None) -> str:

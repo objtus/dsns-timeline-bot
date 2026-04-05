@@ -26,6 +26,95 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+class SessionManager:
+    """統一されたセッション管理クラス"""
+    
+    def __init__(self, mipa_bot):
+        """
+        セッション管理の初期化
+        
+        Args:
+            mipa_bot: MiPAボットインスタンス
+        """
+        self.mipa_bot = mipa_bot
+        self._sessions_to_close = []
+    
+    async def close_all_sessions(self):
+        """全てのセッションを適切に閉じる"""
+        logger.info("セッション管理: 全セッションの切断開始")
+        
+        # 1. MiPA APIセッション（最優先）
+        await self._close_mipa_api_session()
+        
+        # 2. MiPAクライアントセッション
+        await self._close_mipa_client_session()
+        
+        # 3. WebSocket接続
+        await self._close_websocket_session()
+        
+        # 4. その他のセッション
+        await self._close_other_sessions()
+        
+        logger.info("セッション管理: 全セッションの切断完了")
+    
+    async def _close_mipa_api_session(self):
+        """MiPA APIセッションを閉じる"""
+        try:
+            if hasattr(self.mipa_bot, 'core') and self.mipa_bot.core:
+                if hasattr(self.mipa_bot.core, 'close_session'):
+                    await self.mipa_bot.core.close_session()
+                    logger.info("セッション管理: MiPA APIセッション切断完了")
+                else:
+                    logger.debug("セッション管理: MiPA core.close_session()メソッドが利用できません")
+            else:
+                logger.debug("セッション管理: MiPA coreが利用できません")
+        except Exception as e:
+            logger.warning(f"セッション管理: MiPA APIセッション切断エラー（無視）: {e}")
+    
+    async def _close_mipa_client_session(self):
+        """MiPAクライアントセッションを閉じる"""
+        try:
+            if hasattr(self.mipa_bot, 'client') and self.mipa_bot.client:
+                if hasattr(self.mipa_bot.client, 'session') and self.mipa_bot.client.session:
+                    if not self.mipa_bot.client.session.closed:
+                        await self.mipa_bot.client.session.close()
+                        logger.info("セッション管理: MiPAクライアントセッション切断完了")
+                    else:
+                        logger.debug("セッション管理: MiPAクライアントセッションは既に閉じられています")
+                else:
+                    logger.debug("セッション管理: MiPAクライアントセッションが利用できません")
+            else:
+                logger.debug("セッション管理: MiPAクライアントが利用できません")
+        except Exception as e:
+            logger.warning(f"セッション管理: MiPAクライアントセッション切断エラー（無視）: {e}")
+    
+    async def _close_websocket_session(self):
+        """WebSocketセッションを閉じる"""
+        try:
+            if hasattr(self.mipa_bot, 'ws') and self.mipa_bot.ws:
+                if hasattr(self.mipa_bot.ws, 'closed'):
+                    if not self.mipa_bot.ws.closed:
+                        await self.mipa_bot.ws.close()
+                        logger.info("セッション管理: WebSocketセッション切断完了")
+                    else:
+                        logger.debug("セッション管理: WebSocketセッションは既に閉じられています")
+                else:
+                    # closed属性がない場合は直接close()を試行
+                    try:
+                        await self.mipa_bot.ws.close()
+                        logger.info("セッション管理: WebSocketセッション切断完了（直接呼び出し）")
+                    except Exception as direct_close_error:
+                        logger.debug(f"セッション管理: WebSocket直接切断エラー（無視）: {direct_close_error}")
+            else:
+                logger.debug("セッション管理: WebSocketセッションが利用できません")
+        except Exception as e:
+            logger.warning(f"セッション管理: WebSocketセッション切断エラー（無視）: {e}")
+    
+    async def _close_other_sessions(self):
+        """その他のセッションを閉じる"""
+        # 必要に応じて追加のセッション管理を実装
+        pass
+
 class BotClient:
     """MiPA WebSocketクライアント専用管理"""
     
@@ -39,6 +128,7 @@ class BotClient:
         self.config = config
         self.mipa_bot = None
         self.command_router = None
+        self.session_manager = None  # セッション管理
         
         # 接続状態管理
         self.is_connected = False
@@ -47,6 +137,15 @@ class BotClient:
         self.note_count = 0
         self.startup_time: Optional[datetime] = None
         self.mipa_task = None  # MiPAバックグラウンドタスク
+        self.last_posted_note_id: Optional[str] = None  # 最後の投稿ID（LLMコメント用）
+        
+        # 接続監視の強化
+        self.last_connection_attempt: Optional[datetime] = None
+        self.connection_failure_count = 0
+        self.max_connection_failures = getattr(config, 'max_connection_failures', 5)
+        self.connection_health_check_interval = getattr(config, 'connection_health_check_interval', 300)
+        self.heartbeat_timeout_seconds = getattr(config, 'heartbeat_timeout_seconds', 600)
+        self.last_health_check: Optional[datetime] = None
         
         logger.info("BotClient初期化完了")
     
@@ -59,6 +158,131 @@ class BotClient:
         """
         self.command_router = router
         logger.info("CommandRouter設定完了")
+    
+    async def check_connection_health(self):
+        """
+        接続状態のヘルスチェック（強化版）
+        
+        Returns:
+            bool: 接続が正常な場合True
+        """
+        try:
+            if not self.mipa_bot:
+                logger.warning("⚠️ MiPAボットが初期化されていません")
+                return False
+            
+            # 最後のハートビートからの経過時間をチェック
+            if self.last_heartbeat:
+                time_since_heartbeat = (datetime.now() - self.last_heartbeat).total_seconds()
+                if time_since_heartbeat > self.heartbeat_timeout_seconds:  # 10分以上ハートビートがない
+                    logger.warning(f"⚠️ ハートビートが{time_since_heartbeat:.0f}秒間受信されていません")
+                    return False
+            
+            # WebSocket接続状態をチェック
+            if hasattr(self.mipa_bot, 'ws') and self.mipa_bot.ws:
+                # WebSocketオブジェクトの属性をデバッグ出力
+                ws_attrs = [attr for attr in dir(self.mipa_bot.ws) if not attr.startswith('_')]
+                logger.debug(f"WebSocketオブジェクトの属性: {ws_attrs}")
+                
+                # MiPAのWebSocketオブジェクト（ClientWebSocketResponse）の正しい属性を使用
+                if hasattr(self.mipa_bot.ws, 'closed'):
+                    if self.mipa_bot.ws.closed:
+                        logger.warning("⚠️ WebSocket接続が切断されています")
+                        return False
+                elif hasattr(self.mipa_bot.ws, 'open'):
+                    if not self.mipa_bot.ws.open:
+                        logger.warning("⚠️ WebSocket接続が切断されています")
+                        return False
+                else:
+                    # どちらの属性も存在しない場合は、pingで接続確認
+                    logger.debug("WebSocket接続状態をpingで確認します")
+                
+                # 接続の生存確認（ping）
+                try:
+                    if hasattr(self.mipa_bot.ws, 'ping') and callable(getattr(self.mipa_bot.ws, 'ping')):
+                        try:
+                            await asyncio.wait_for(self.mipa_bot.ws.ping(), timeout=5.0)
+                            logger.debug("✅ WebSocket ping成功")
+                        except asyncio.TimeoutError:
+                            logger.warning("⚠️ WebSocket pingタイムアウト")
+                            return False
+                        except Exception as ping_error:
+                            logger.warning(f"⚠️ WebSocket pingエラー: {ping_error}")
+                            return False
+                    else:
+                        logger.debug("WebSocket ping機能が利用できません")
+                            
+                except Exception as ws_check_error:
+                    logger.warning(f"⚠️ WebSocket状態チェックエラー: {ws_check_error}")
+                    return False
+            
+            # MiPAボットの内部状態チェック（セッション管理を使用）
+            if self.session_manager:
+                try:
+                    # セッション状態をチェック
+                    if hasattr(self.mipa_bot, 'client') and self.mipa_bot.client:
+                        if hasattr(self.mipa_bot.client, 'session') and self.mipa_bot.client.session:
+                            if self.mipa_bot.client.session.closed:
+                                logger.warning("⚠️ MiPAクライアントセッションが閉じられています")
+                                return False
+                except Exception as client_check_error:
+                    logger.warning(f"⚠️ MiPAクライアント状態チェックエラー: {client_check_error}")
+                    return False
+            else:
+                logger.debug("セッション管理が初期化されていないため、セッション状態チェックをスキップ")
+            
+            logger.debug("✅ 接続状態は正常です")
+            return True
+            
+        except Exception as e:
+            logger.error(f"接続状態チェックエラー: {e}")
+            return False
+    
+    async def attempt_reconnection(self):
+        """
+        手動再接続の試行（強化版）
+        
+        Returns:
+            bool: 再接続成功時True
+        """
+        try:
+            logger.info("🔄 手動再接続を試行します")
+            
+            # 接続失敗回数をチェック
+            if self.connection_failure_count >= self.max_connection_failures:
+                logger.error(f"❌ 接続失敗回数が上限({self.max_connection_failures}回)に達しました")
+                logger.error("手動での復旧が必要です")
+                return False
+            
+            # 既存の接続を適切に切断
+            await self._cleanup_existing_connection()
+            
+            # 接続状態をリセット
+            self.is_connected = False
+            self.last_heartbeat = None
+            
+            # 新しい接続を試行
+            await self.connect()
+            
+            # 接続成功を確認
+            await asyncio.sleep(5)  # 接続安定化のため5秒待機
+            
+            if await self.check_connection_health():
+                logger.info("✅ 再接続が成功しました")
+                self.connection_failure_count = 0  # 失敗回数をリセット
+                return True
+            else:
+                logger.warning("⚠️ 再接続後の接続状態チェックに失敗")
+                return False
+            
+        except Exception as e:
+            self.connection_failure_count += 1
+            logger.error(f"❌ 手動再接続に失敗しました (失敗回数: {self.connection_failure_count}/{self.max_connection_failures}): {e}")
+            return False
+    
+    async def _cleanup_existing_connection(self):
+        """既存の接続を適切にクリーンアップ（disconnect()メソッドを使用）"""
+        await self.disconnect()
     
     async def connect(self):
         """
@@ -86,16 +310,91 @@ class BotClient:
             # カスタムボットクラス作成
             self.mipa_bot = DSNSMiPABot(self)
             
+            # セッション管理を初期化
+            self.session_manager = SessionManager(self.mipa_bot)
+            logger.info("セッション管理を初期化しました")
+            
             # MiPAのstart()をバックグラウンドタスクで実行
             loop = asyncio.get_running_loop()
             self.mipa_task = loop.create_task(self.mipa_bot.start(ws_url, token))
             logger.info("MiPA start()をバックグラウンドで実行開始")
+            
+            # 接続状態監視タスクを開始
+            self._start_connection_monitor(loop)
+            
             # すぐにreturnし、メインループへ制御を返す
             
         except Exception as e:
             logger.error(f"WebSocket接続エラー: {e}")
             logger.debug(traceback.format_exc())
             raise NetworkError(f"WebSocket接続に失敗しました: {e}", url=ws_url)
+    
+    def _start_connection_monitor(self, loop):
+        """接続状態監視タスクを開始"""
+        try:
+            monitor_task = loop.create_task(self._connection_monitor_loop())
+            logger.info("接続状態監視タスクを開始しました")
+        except Exception as e:
+            logger.error(f"接続状態監視タスクの開始に失敗: {e}")
+    
+    async def _connection_monitor_loop(self):
+        """接続状態監視ループ（強化版）"""
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+        
+        while True:
+            try:
+                await asyncio.sleep(self.connection_health_check_interval)
+                
+                # 接続状態をチェック
+                is_healthy = await self.check_connection_health()
+                
+                if is_healthy:
+                    consecutive_failures = 0  # 連続失敗回数をリセット
+                    logger.debug("✅ 接続状態監視: 正常")
+                else:
+                    consecutive_failures += 1
+                    logger.warning(f"⚠️ 接続状態に問題を検出しました (連続失敗: {consecutive_failures}/{max_consecutive_failures})")
+                    
+                    # 連続失敗回数が上限に達した場合のみ自動復旧を試行
+                    if consecutive_failures >= max_consecutive_failures:
+                        if self.connection_failure_count < self.max_connection_failures:
+                            logger.info("🔄 連続失敗による自動復旧を試行します")
+                            recovery_success = await self.attempt_reconnection()
+                            
+                            if recovery_success:
+                                consecutive_failures = 0  # 復旧成功時はリセット
+                                logger.info("✅ 自動復旧が成功しました")
+                            else:
+                                logger.warning("⚠️ 自動復旧に失敗しました")
+                        else:
+                            logger.critical("🚨 自動復旧の上限に達しました。手動での復旧が必要です。")
+                            # システム管理者への通知を検討
+                            break
+                    else:
+                        logger.info(f"⚠️ 連続失敗回数が少ないため、自動復旧は見送ります ({consecutive_failures}/{max_consecutive_failures})")
+                
+                # ヘルスチェック時刻を更新
+                self.last_health_check = datetime.now()
+                
+            except asyncio.CancelledError:
+                logger.info("接続状態監視タスクがキャンセルされました")
+                break
+            except Exception as e:
+                logger.error(f"接続状態監視エラー: {e}")
+                consecutive_failures += 1
+                
+                # エラーの詳細をログ出力
+                if "object has no attribute" in str(e):
+                    logger.warning("⚠️ WebSocketオブジェクトの属性エラーが発生しています")
+                    logger.warning("MiPAライブラリのバージョン互換性を確認してください")
+                    logger.warning("MiPAガイド: https://mipa.akarinext.org を参照してください")
+                elif "connection" in str(e).lower():
+                    logger.warning("⚠️ 接続エラーが発生しています")
+                elif "timeout" in str(e).lower():
+                    logger.warning("⚠️ タイムアウトエラーが発生しています")
+                
+                await asyncio.sleep(60)  # エラー時は1分待機
     
     def _get_misskey_host(self) -> str:
         """Misskeyホスト名を取得"""
@@ -119,13 +418,94 @@ class BotClient:
         visibility = self._get_note_visibility(note)
         logger.debug(f"元の投稿の公開範囲: {visibility}")
         
-        # 統一された投稿処理を使用
-        return await self._create_note(
-            message=message,
-            visibility=visibility,
-            reply_id=note.id,
-            context="リプライ"
-        )
+        # まずリプライを試行
+        try:
+            if self.config.dry_run_mode:
+                logger.info(f"🔧 [ドライラン] リプライ ({visibility}): {message[:100]}...")
+                return True
+            
+            if not self.mipa_bot:
+                logger.error("MiPA botインスタンスが初期化されていません")
+                return False
+            
+            # 文字数制限チェック
+            if len(message) > MessageLimits.MAX_LENGTH:
+                logger.warning(f"メッセージが長すぎます: {len(message)}文字")
+                message = message[:MessageLimits.TRUNCATE_LENGTH] + "..."
+            
+            # リプライとして送信
+            await self.mipa_bot.client.note.action.create(
+                text=message,
+                visibility=visibility,
+                reply_id=note.id
+            )
+            logger.info(f"✅ リプライ送信完了: {len(message)}文字")
+            return True
+            
+        except Exception as e:
+            error_str = str(e)
+            
+            # DMへのリプライエラーの場合は新規DMにフォールバック
+            if "CANNOT_REPLY_TO_AN_INVISIBLE_NOTE" in error_str or "invisible Note" in error_str:
+                logger.warning("DMへのリプライは不可 → 新規DMとして送信")
+                return await self._send_dm(note, message)
+            
+            # その他のエラー
+            logger.error(f"リプライエラー: {e}")
+            logger.debug(traceback.format_exc())
+            return False
+    
+    async def _send_dm(self, note, message: str) -> bool:
+        """
+        DM送信（specified visibility用）
+        
+        Args:
+            note: 元のnoteオブジェクト
+            message: 送信メッセージ
+            
+        Returns:
+            bool: 送信成功時True
+        """
+        try:
+            if self.config.dry_run_mode:
+                logger.info(f"🔧 [ドライラン] DM送信 (specified): {message[:100]}...")
+                return True
+            
+            if not self.mipa_bot:
+                logger.error("MiPA botインスタンスが初期化されていません")
+                return False
+            
+            # 送信先ユーザーIDを取得（複数の方法を試行）
+            user_id = None
+            if hasattr(note, 'user_id'):
+                user_id = note.user_id
+            elif hasattr(note, 'user') and hasattr(note.user, 'id'):
+                user_id = note.user.id
+            
+            if not user_id:
+                logger.error(f"送信先ユーザーIDが取得できません: note type={type(note).__name__}")
+                return False
+            
+            logger.info(f"DM送信先: user_id={user_id}")
+            
+            # 文字数制限チェック
+            if len(message) > MessageLimits.MAX_LENGTH:
+                logger.warning(f"メッセージが長すぎます: {len(message)}文字")
+                message = message[:MessageLimits.TRUNCATE_LENGTH] + "..."
+            
+            # DMとして送信（reply_idなし、visible_user_ids指定）
+            await self.mipa_bot.client.note.action.create(
+                text=message,
+                visibility='specified',
+                visible_user_ids=[user_id]
+            )
+            logger.info(f"✅ DM送信完了 (specified)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"DM送信エラー: {e}")
+            logger.debug(traceback.format_exc())
+            return False
     
     def _get_note_visibility(self, note) -> VisibilityType:
         """
@@ -164,7 +544,7 @@ class BotClient:
             return Visibility.PUBLIC
     
     async def _create_note(self, message: str, visibility: VisibilityType = Visibility.PUBLIC, 
-                          reply_id: Optional[str] = None, context: str = "投稿") -> bool:
+                          reply_id: Optional[str] = None, context: str = "投稿") -> Optional[str]:
         """
         統一されたノート作成処理
         
@@ -175,12 +555,12 @@ class BotClient:
             context: 投稿コンテキスト（ログ用）
             
         Returns:
-            bool: 投稿成功時True
+            Optional[str]: 投稿成功時はnote ID、失敗時はNone
         """
         try:
             if self.config.dry_run_mode:
                 logger.info(f"🔧 [ドライラン] {context} ({visibility}): {message[:100]}...")
-                return True
+                return "dry_run_note_id"
             
             if not self.mipa_bot:
                 raise BotClientError("MiPAボットが初期化されていません")
@@ -197,27 +577,42 @@ class BotClient:
                     max_length=MessageLimits.MAX_LENGTH
                 )
             
-            # 投稿パラメータを構築
+            # 投稿パラメータを構築してAPIを呼び出し
             if reply_id:
-                await self.mipa_bot.client.note.action.create(
+                created_note = await self.mipa_bot.client.note.action.create(
                     text=message,
                     visibility=visibility,
                     reply_id=reply_id
                 )
             else:
-                await self.mipa_bot.client.note.action.create(
+                created_note = await self.mipa_bot.client.note.action.create(
                     text=message,
                     visibility=visibility
                 )
-            logger.info(f"✅ {context}完了 ({visibility})")
-            return True
+            
+            # note IDを取得
+            note_id = None
+            if created_note:
+                note_id = getattr(created_note, 'id', None) or (created_note.get('id') if isinstance(created_note, dict) else None)
+            
+            if note_id:
+                logger.info(f"✅ {context}完了 ({visibility}): note_id={note_id}")
+                # 定期投稿の場合は最後の投稿IDとして保存
+                if context == "定期投稿":
+                    self.last_posted_note_id = note_id
+                    logger.info(f"最後の投稿ID保存: {note_id}")
+                return note_id
+            else:
+                logger.warning(f"{context}完了したが、note IDが取得できませんでした")
+                return None
             
         except Exception as e:
+            error_str = str(e)
             logger.error(f"{context}エラー: {e}")
             logger.debug(traceback.format_exc())
             
             # エラーが文字数制限によるものかチェック
-            if "maxLength" in str(e) or str(MessageLimits.MAX_LENGTH) in str(e):
+            if "maxLength" in error_str or str(MessageLimits.MAX_LENGTH) in error_str:
                 logger.warning("文字数制限エラーを検出しました")
                 # 短縮版メッセージを送信
                 if self.mipa_bot:
@@ -284,37 +679,31 @@ class BotClient:
                     else:
                         logger.error(f"ボット切断エラー: {e}")
                 
-                # セッション切断処理
-                try:
-                    # MiPAの正しいセッション管理: API.core.close_sessionを使用
-                    if hasattr(self.mipa_bot, 'core') and self.mipa_bot.core:
-                        await self.mipa_bot.core.close_session() # type: ignore
-                        logger.info("MiPA APIセッション切断完了")
-                    
-                    # フォールバック: グローバルHTTPSession
-                    try:
-                        from mipa.http import HTTPSession
-                        if hasattr(HTTPSession, 'close_session'):
-                            await HTTPSession.close_session()
-                            logger.info("MiPAグローバルHTTPSession切断完了")
-                    except Exception:
-                        pass  # グローバルセッションは失敗しても問題なし
-                        
-                except Exception as e:
-                    logger.error(f"セッション切断エラー: {e}")
+                # 統一されたセッション管理を使用
+                if self.session_manager:
+                    await self.session_manager.close_all_sessions()
+                else:
+                    logger.warning("セッション管理が初期化されていません")
             
             # MiPAバックグラウンドタスクのキャンセル
             if self.mipa_task:
                 logger.info("MiPAバックグラウンドタスクをキャンセルします")
                 self.mipa_task.cancel()
                 try:
-                    await self.mipa_task
+                    await asyncio.wait_for(self.mipa_task, timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.warning("MiPAタスクのキャンセルがタイムアウトしました")
                 except asyncio.CancelledError:
                     logger.info("MiPAタスクのキャンセル完了")
                 except Exception as e:
                     logger.error(f"MiPAタスクキャンセル時エラー: {e}")
             
+            # 接続状態をリセット
+            self.mipa_bot = None
+            self.mipa_task = None
             self.is_connected = False
+            self.last_heartbeat = None
+            
             logger.info("✅ 切断処理完了")
             
         except Exception as e:
@@ -429,12 +818,36 @@ class DSNSMiPABot(Bot):
         """再接続時"""
         try:
             logger.info("🔄 ボット再接続開始")
+            
+            # 接続状態を更新
+            self.parent.connection_count += 1
+            self.parent.last_connection_attempt = datetime.now()
+            
+            # 再接続の原因を分析
+            if self.parent.last_heartbeat:
+                time_since_heartbeat = (datetime.now() - self.parent.last_heartbeat).total_seconds()
+                logger.info(f"📊 最後のハートビートから{time_since_heartbeat:.0f}秒経過")
+            
+            # チャンネル再接続
             await self._connect_channel()
+            
+            # 接続状態を更新
+            self.parent.is_connected = True
+            self.parent.last_heartbeat = datetime.now()
+            
             logger.info("✅ ボット再接続完了")
             
         except Exception as e:
             logger.error(f"再接続エラー: {e}")
             logger.debug(traceback.format_exc())
+            
+            # 接続失敗を記録
+            self.parent.connection_failure_count += 1
+            logger.error(f"❌ 再接続失敗 (失敗回数: {self.parent.connection_failure_count}/{self.parent.max_connection_failures})")
+            
+            # 失敗回数が上限に達した場合の警告
+            if self.parent.connection_failure_count >= self.parent.max_connection_failures:
+                logger.critical("🚨 再接続失敗回数が上限に達しました。手動での復旧が必要です。")
     
     async def on_note(self, note):
         """ノート受信時（通常の投稿）"""
@@ -507,8 +920,17 @@ class DSNSMiPABot(Bot):
             user_info = await self.client.user.action.get(user_id=actual_note.user_id)
             visibility = getattr(actual_note, 'visibility', 'unknown')
             
-            # text属性の安全な取得
-            note_text = getattr(actual_note, 'text', '')
+            # text属性の取得（MiPAのNote内部構造に対応）
+            note_text = None
+            # 方法1: 通常のtext属性
+            if hasattr(actual_note, 'text') and actual_note.text:
+                note_text = actual_note.text
+            # 方法2: raw_noteから取得
+            elif hasattr(actual_note, '_Note__raw_note'):
+                raw_note = actual_note._Note__raw_note
+                if isinstance(raw_note, dict):
+                    note_text = raw_note.get('text', '')
+            
             if note_text:
                 preview = note_text[:50] + "..." if len(note_text) > 50 else note_text
             else:
@@ -567,12 +989,31 @@ class DSNSMiPABot(Bot):
             logger.error(f"WebSocketエラー: {error}")
             
             # エラー内容に応じた処理
-            if "connection" in str(error).lower():
-                logger.warning("接続エラーが発生しました")
-            elif "timeout" in str(error).lower():
-                logger.warning("タイムアウトエラーが発生しました")
+            error_str = str(error).lower()
+            
+            if "connection" in error_str:
+                logger.warning("🔌 接続エラーが発生しました")
+                self.parent.connection_failure_count += 1
+            elif "timeout" in error_str:
+                logger.warning("⏰ タイムアウトエラーが発生しました")
+                self.parent.connection_failure_count += 1
+            elif "websocket" in error_str:
+                logger.warning("🌐 WebSocketエラーが発生しました")
+                self.parent.connection_failure_count += 1
+            elif "ssl" in error_str:
+                logger.warning("🔒 SSL/TLSエラーが発生しました")
+                self.parent.connection_failure_count += 1
             else:
-                logger.warning("不明なエラーが発生しました")
+                logger.warning("❓ 不明なエラーが発生しました")
+                self.parent.connection_failure_count += 1
+            
+            # 接続失敗回数の警告
+            if self.parent.connection_failure_count >= self.parent.max_connection_failures:
+                logger.critical("🚨 WebSocketエラーが多発しています。接続状態を確認してください。")
+            
+            # エラーの詳細情報をログ出力
+            logger.debug(f"エラー詳細: {type(error).__name__}: {error}")
+            logger.debug(f"現在の接続失敗回数: {self.parent.connection_failure_count}")
                 
         except Exception as e:
             logger.error(f"エラーハンドリングエラー: {e}")

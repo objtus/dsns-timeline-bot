@@ -1,0 +1,31 @@
+[Unit]
+Description=DSNS Timeline Bot Main Service (常駐型)
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/objtus/dsns_timeline_bot
+ExecStart=/home/objtus/dsns_timeline_bot/.venv/bin/python main.py
+User=objtus
+Group=objtus
+
+# 環境変数設定
+Environment=PATH=/home/objtus/dsns_timeline_bot/.venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/home/objtus/dsns_timeline_bot
+
+# ログ設定
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsns-bot-main
+
+# 再起動設定
+Restart=always
+RestartSec=10
+
+# タイムアウト設定
+TimeoutStartSec=300
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
